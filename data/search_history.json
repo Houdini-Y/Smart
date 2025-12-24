@@ -1,5 +1,33 @@
 [
   {
+    "time": "2025-12-24 16:05:27",
+    "query": "'laptop with 16GB RAM'\n",
+    "attrs": {
+      "lang": "en",
+      "product": "laptop",
+      "brand": null,
+      "color": null,
+      "size": null,
+      "price_range": {
+        "min": null,
+        "max": null,
+        "target": null
+      },
+      "features": {
+        "storage_gb": "16",
+        "ram_gb": "16"
+      },
+      "quality_level": null,
+      "tokens": [
+        "laptop",
+        "16gb",
+        "ram"
+      ],
+      "budget": null
+    },
+    "count": 15
+  },
+  {
     "time": "2025-12-24 15:24:38",
     "query": "ساعة هواوي \n",
     "attrs": {
