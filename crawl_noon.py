@@ -1,11 +1,22 @@
-import requests
+# crawl_noon.py  (FINAL FIXED VERSION)
+# - Uses Noon JSON search endpoint (/api/v3/u/search) and parses "hits"
+# - Backward-compatible signature with crawl_multi_platform.py (pages, detailed, max_products, append, etc.)
+# - Normalizes long queries (e.g., "laptop 16gb ram" -> "laptop") to improve recall
+# - FIXES IMAGE URLs: ensures proper CDN prefix, including the required "/p/" for keys like "pnsku/..."
+# - Saves the same CSV schema as your other crawlers:
+#   title, price, rating, image, product_link, description, search_query, website
+
 import csv
 import os
-from typing import List, Dict
+import re
+import time
+from typing import Dict, List, Optional
+from urllib.parse import urljoin
 
-BASE_API = "https://www.noon.com/_svc/catalog/api/v3/search"
+import requests
+
+BASE_API = "https://www.noon.com/_svc/catalog/api/v3/u/search/"
 BASE_SITE = "https://www.noon.com/egypt-en"
-IMAGE_CDN = "https://f.nooncdn.com/p/v1686225580/"
 
 HEADERS = {
     "User-Agent": (
@@ -14,70 +25,244 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": BASE_SITE,
 }
+
+
+def normalize_noon_query(query: str) -> str:
+    """
+    Noon API tends to work better with short, brand-oriented queries.
+    Examples:
+      - "laptop 16gb ram" -> "laptop"
+      - "hp laptop 32gb ssd" -> "hp laptop"
+    """
+    q = (query or "").lower()
+    q = re.sub(r"\b\d+gb\b", "", q)
+    q = re.sub(r"\bram\b", "", q)
+    q = re.sub(r"\bssd\b", "", q)
+    q = re.sub(r"\bhdd\b", "", q)
+    q = re.sub(r"\b\d+\b", "", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def _safe_get_json(session: requests.Session, params: dict, timeout: int = 15) -> Optional[dict]:
+    try:
+        r = session.get(BASE_API, headers=HEADERS, params=params, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"❌ Noon API error: {e}")
+        return None
+
+
+def _pick_price(hit: dict) -> str:
+    """
+    Price fields vary; try multiple candidates.
+    """
+    candidates = [
+        ("price", "value"),
+        ("sale_price", "value"),
+        ("offer_price", "value"),
+        ("final_price", None),
+        ("price", None),
+        ("sale_price", None),
+        ("offer_price", None),
+    ]
+    for key, sub in candidates:
+        if key not in hit or hit[key] is None:
+            continue
+        v = hit[key]
+        if isinstance(v, dict) and sub:
+            vv = v.get(sub)
+            if vv is not None:
+                return str(vv)
+        if not isinstance(v, dict):
+            return str(v)
+    return ""
+
+
+def _pick_rating(hit: dict) -> str:
+    for k in ["rating", "reviews_average", "avg_rating", "average_rating"]:
+        if k in hit and hit[k] is not None:
+            return str(hit[k])
+    return ""
+
+
+def _build_noon_image_url(key: str, prefer_size: Optional[int] = 320) -> str:
+    """
+    Noon image keys can look like:
+      - "pnsku/N701.../45/_/...jpg"  (requires "/p/" prefix)
+      - "pim/...."                  (often also under "/p/")
+      - already a full https URL
+
+    This function returns a proper CDN URL.
+    """
+    key = (key or "").strip()
+    if not key:
+        return ""
+
+    # Already a full URL
+    if key.startswith("http://") or key.startswith("https://"):
+        url = key
+    else:
+        # Normalize leading slash
+        if key.startswith("/"):
+            key = key[1:]
+
+        # CRITICAL FIX:
+        # Keys beginning with pnsku/ (and some others) should be served under /p/
+        if key.startswith(("pnsku/", "pim/", "pmd/", "psku/")):
+            url = "https://f.nooncdn.com/p/" + key
+        else:
+            url = "https://f.nooncdn.com/" + key
+
+        # Add extension if missing (best effort)
+        if not re.search(r"\.(jpg|jpeg|png|webp)$", url, re.IGNORECASE):
+            url += ".jpg"
+
+    # Optional: prefer a larger size than "/45/" if present
+    if prefer_size and isinstance(prefer_size, int):
+        # Many Noon keys use ".../<size>/_/..."
+        url = re.sub(r"/(45|60|80|120|160)/_/", f"/{prefer_size}/_/", url)
+
+    return url
+
+
+def _pick_image(hit: dict) -> str:
+    """
+    Try multiple possible places Noon might store image info.
+    """
+    candidates: List[Optional[str]] = [
+        hit.get("image_key"),
+        hit.get("imageKey"),
+        hit.get("image"),
+        hit.get("thumbnail"),
+        hit.get("product_image"),
+    ]
+
+    images = hit.get("images")
+    if isinstance(images, list) and images:
+        first = images[0]
+        if isinstance(first, dict):
+            candidates.append(first.get("key") or first.get("image_key") or first.get("url"))
+        elif isinstance(first, str):
+            candidates.append(first)
+    elif isinstance(images, dict):
+        candidates.append(images.get("key") or images.get("image_key") or images.get("url"))
+
+    for c in candidates:
+        if isinstance(c, str) and c.strip():
+            return _build_noon_image_url(c.strip(), prefer_size=320)
+
+    return ""
+
+
+def _pick_link(hit: dict) -> str:
+    slug = hit.get("url") or hit.get("product_url") or hit.get("path") or ""
+    if not slug:
+        return ""
+    if isinstance(slug, str) and (slug.startswith("http://") or slug.startswith("https://")):
+        return slug
+    return urljoin(BASE_SITE + "/", str(slug).lstrip("/"))
 
 
 def crawl_noon_to_csv(
     query: str,
     output_path: str = "noon_products.csv",
-    page: int = 1,
-    limit: int = 20,
+    pages: int = 1,
+    detailed: bool = False,       # kept for compatibility (not used)
+    max_products: int = 0,
+    delay: float = 1.0,
     append: bool = False,
+    **kwargs                      # swallow extra args safely
 ) -> int:
     """
-    Fast & reliable Noon crawler using JSON API.
-    Saves data in SAME structure as other platforms.
+    Fast & reliable Noon crawler using JSON API (/u/search).
+    Compatible with crawl_multi_platform.py.
+    Returns number of collected items.
     """
+    print(f"🔍 Starting Noon search for: '{query}'")
+    print(f"📄 Pages to crawl: {pages}")
+    print(f"🎯 Max products: {max_products if max_products > 0 else 'unlimited'}")
 
-    params = {
-        "q": query,
-        "country": "eg",
-        "page": page,
-        "limit": limit,
-    }
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-    print(f"⚡ Noon API search: '{query}'")
-
-    r = requests.get(
-        BASE_API,
-        headers=HEADERS,
-        params=params,
-        timeout=15,
-    )
-    r.raise_for_status()
-
-    data = r.json()
-    products = data.get("products", [])
-
-    rows: List[Dict] = []
-
-    for item in products:
-        image_key = item.get("image_key", "")
-        image_url = f"{IMAGE_CDN}{image_key}.jpg" if image_key else ""
-
-        rows.append({
-            "title": item.get("name", ""),
-            "price": str(item.get("price", {}).get("value", "")),
-            "rating": str(item.get("rating", "")),
-            "image": image_url,
-            "product_link": f"{BASE_SITE}/{item.get('url', '')}",
-            "description": "",
-            "search_query": query,
-            "website": "Noon",
-        })
-
-    if not rows:
-        print("⚠️ No products returned from Noon API")
-        return 0
-
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    normalized = normalize_noon_query(query)
 
     fieldnames = [
         "title", "price", "rating",
         "image", "product_link",
         "description", "search_query", "website"
     ]
+
+    rows: List[Dict] = []
+    per_page_limit = 50
+    page_number = 1
+
+    while True:
+        if pages and page_number > pages:
+            break
+
+        # Try normalized query first, fallback to raw query
+        got_hits = False
+        for q_try in [normalized, query]:
+            params = {
+                "q": q_try,
+                "page": page_number,
+                "limit": per_page_limit,
+                "country": "eg",  # best-effort hint (harmless if ignored)
+            }
+
+            print(f"📖 Calling Noon API page {page_number} (q='{q_try}')...")
+            data = _safe_get_json(session, params=params, timeout=15)
+            if not data:
+                continue
+
+            hits = data.get("hits") or []
+            if not hits:
+                continue
+
+            got_hits = True
+            for hit in hits:
+                title = hit.get("name") or hit.get("title") or ""
+                if not title:
+                    continue
+
+                rows.append({
+                    "title": str(title),
+                    "price": _pick_price(hit),
+                    "rating": _pick_rating(hit),
+                    "image": _pick_image(hit),
+                    "product_link": _pick_link(hit),
+                    "description": "",      # keep schema consistent
+                    "search_query": query,  # keep original user query
+                    "website": "Noon",
+                })
+
+                if max_products and len(rows) >= max_products:
+                    break
+            break  # stop trying raw query if normalized worked (or vice versa)
+
+        if max_products and len(rows) >= max_products:
+            print(f"🎯 Reached max-products limit ({max_products})")
+            break
+
+        if not got_hits:
+            if page_number == 1:
+                print("ℹ️ No hits returned from Noon API. Stopping pagination.")
+            break
+
+        page_number += 1
+        time.sleep(max(0.2, delay))
+
+    if not rows:
+        print("⚠️ No products collected")
+        return 0
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     mode = "a" if append else "w"
     file_exists = append and os.path.exists(output_path)
@@ -88,5 +273,12 @@ def crawl_noon_to_csv(
             writer.writeheader()
         writer.writerows(rows)
 
-    print(f"✅ Saved {len(rows)} Noon products")
+    print(f"💾 Saved {len(rows)} Noon products to {output_path}")
     return len(rows)
+
+
+if __name__ == "__main__":
+    # Quick manual test:
+    # python crawl_noon.py
+    n = crawl_noon_to_csv("samsung s25 ultra", output_path="noon_test.csv", pages=1, max_products=10)
+    print("Collected:", n)

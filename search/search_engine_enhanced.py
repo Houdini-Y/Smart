@@ -122,16 +122,21 @@ def search_products_enhanced(
     # ==============================
     # TF-IDF SIMILARITY
     # ==============================
+    result = result.reset_index(drop=True)
+
     vectorizer, tfidf_matrix = build_tfidf_model(df)
+
     similarity_scores = compute_similarity(
         attrs.get("raw_query", ""),
         vectorizer,
         tfidf_matrix
     )
 
-    result["tfidf_score"] = [
-        similarity_scores[i] * 100 for i in result.index
-    ]
+    # SAFE indexing
+    result["tfidf_score"] = result.index.map(
+        lambda i: similarity_scores[i] * 100 if i < len(similarity_scores) else 0.0
+    )
+
 
     # ==============================
     # HYBRID FINAL SCORE
