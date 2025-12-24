@@ -1,9 +1,9 @@
-# crawl_noon.py  (FINAL FIXED VERSION)
-# - Uses Noon JSON search endpoint (/api/v3/u/search) and parses "hits"
-# - Backward-compatible signature with crawl_multi_platform.py (pages, detailed, max_products, append, etc.)
-# - Normalizes long queries (e.g., "laptop 16gb ram" -> "laptop") to improve recall
-# - FIXES IMAGE URLs: ensures proper CDN prefix, including the required "/p/" for keys like "pnsku/..."
-# - Saves the same CSV schema as your other crawlers:
+# crawl_noon.py (FINAL FIX)
+# - Correct Noon JSON endpoint: /_svc/catalog/api/v3/u/search/ (returns "hits")
+# - Backward-compatible signature with crawl_multi_platform.py and tests (pages, max_products, detailed, append)
+# - Query normalization for better recall on Noon
+# - FIXED images: ensures correct CDN URL, including required "/p/" prefix for keys like "pnsku/..."
+# - Outputs consistent CSV schema:
 #   title, price, rating, image, product_link, description, search_query, website
 
 import csv
@@ -32,10 +32,8 @@ HEADERS = {
 
 def normalize_noon_query(query: str) -> str:
     """
-    Noon API tends to work better with short, brand-oriented queries.
-    Examples:
-      - "laptop 16gb ram" -> "laptop"
-      - "hp laptop 32gb ssd" -> "hp laptop"
+    Noon API usually works better with short, brand-oriented queries.
+    Example: "laptop 16gb ram" -> "laptop"
     """
     q = (query or "").lower()
     q = re.sub(r"\b\d+gb\b", "", q)
@@ -58,9 +56,7 @@ def _safe_get_json(session: requests.Session, params: dict, timeout: int = 15) -
 
 
 def _pick_price(hit: dict) -> str:
-    """
-    Price fields vary; try multiple candidates.
-    """
+    # Noon payload varies; try multiple price representations
     candidates = [
         ("price", "value"),
         ("sale_price", "value"),
@@ -90,50 +86,42 @@ def _pick_rating(hit: dict) -> str:
     return ""
 
 
-def _build_noon_image_url(key: str, prefer_size: Optional[int] = 320) -> str:
+def _build_noon_image_url(key: str, prefer_size: Optional[int] = None) -> str:
     """
     Noon image keys can look like:
-      - "pnsku/N701.../45/_/...jpg"  (requires "/p/" prefix)
-      - "pim/...."                  (often also under "/p/")
-      - already a full https URL
-
-    This function returns a proper CDN URL.
+      - "pnsku/N701.../45/_/...jpg"  -> needs: https://f.nooncdn.com/p/pnsku/...
+      - "pim/..."                   -> often also under /p/
+      - already full URL            -> keep as-is
     """
     key = (key or "").strip()
     if not key:
         return ""
 
-    # Already a full URL
+    # already a URL
     if key.startswith("http://") or key.startswith("https://"):
         url = key
     else:
-        # Normalize leading slash
         if key.startswith("/"):
             key = key[1:]
 
-        # CRITICAL FIX:
-        # Keys beginning with pnsku/ (and some others) should be served under /p/
+        # CRITICAL: keys like "pnsku/..." should be served under "/p/"
         if key.startswith(("pnsku/", "pim/", "pmd/", "psku/")):
             url = "https://f.nooncdn.com/p/" + key
         else:
             url = "https://f.nooncdn.com/" + key
 
-        # Add extension if missing (best effort)
+        # add extension if missing (best-effort)
         if not re.search(r"\.(jpg|jpeg|png|webp)$", url, re.IGNORECASE):
             url += ".jpg"
 
-    # Optional: prefer a larger size than "/45/" if present
-    if prefer_size and isinstance(prefer_size, int):
-        # Many Noon keys use ".../<size>/_/..."
-        url = re.sub(r"/(45|60|80|120|160)/_/", f"/{prefer_size}/_/", url)
+    # Optional: increase size if key has "/45/_/" etc.
+    # if prefer_size and isinstance(prefer_size, int):
+    #     url = re.sub(r"/(45|60|80|120|160)/_/", f"/{prefer_size}/_/", url)
 
     return url
 
 
 def _pick_image(hit: dict) -> str:
-    """
-    Try multiple possible places Noon might store image info.
-    """
     candidates: List[Optional[str]] = [
         hit.get("image_key"),
         hit.get("imageKey"),
@@ -154,7 +142,7 @@ def _pick_image(hit: dict) -> str:
 
     for c in candidates:
         if isinstance(c, str) and c.strip():
-            return _build_noon_image_url(c.strip(), prefer_size=320)
+            return _build_noon_image_url(c.strip())
 
     return ""
 
@@ -172,17 +160,17 @@ def crawl_noon_to_csv(
     query: str,
     output_path: str = "noon_products.csv",
     pages: int = 1,
-    detailed: bool = False,       # kept for compatibility (not used)
-    max_products: int = 0,
     delay: float = 1.0,
+    detailed: bool = False,     # kept for compatibility (not used)
+    max_products: int = 0,
     append: bool = False,
-    **kwargs                      # swallow extra args safely
+    **kwargs                    # swallow extra args from orchestrator safely
 ) -> int:
     """
-    Fast & reliable Noon crawler using JSON API (/u/search).
-    Compatible with crawl_multi_platform.py.
-    Returns number of collected items.
+    Noon crawler used by crawl_multi_platform.py.
+    Returns number of products collected.
     """
+
     print(f"🔍 Starting Noon search for: '{query}'")
     print(f"📄 Pages to crawl: {pages}")
     print(f"🎯 Max products: {max_products if max_products > 0 else 'unlimited'}")
@@ -206,14 +194,13 @@ def crawl_noon_to_csv(
         if pages and page_number > pages:
             break
 
-        # Try normalized query first, fallback to raw query
         got_hits = False
-        for q_try in [normalized, query]:
+        for q_try in [normalized, query]:  # normalized first, then raw fallback
             params = {
                 "q": q_try,
                 "page": page_number,
                 "limit": per_page_limit,
-                "country": "eg",  # best-effort hint (harmless if ignored)
+                "country": "eg",  # best-effort hint
             }
 
             print(f"📖 Calling Noon API page {page_number} (q='{q_try}')...")
@@ -237,14 +224,15 @@ def crawl_noon_to_csv(
                     "rating": _pick_rating(hit),
                     "image": _pick_image(hit),
                     "product_link": _pick_link(hit),
-                    "description": "",      # keep schema consistent
-                    "search_query": query,  # keep original user query
+                    "description": "",      # keep consistent schema
+                    "search_query": query,  # preserve original user query
                     "website": "Noon",
                 })
 
                 if max_products and len(rows) >= max_products:
                     break
-            break  # stop trying raw query if normalized worked (or vice versa)
+
+            break  # stop trying the other q_try once we got hits
 
         if max_products and len(rows) >= max_products:
             print(f"🎯 Reached max-products limit ({max_products})")
@@ -275,10 +263,3 @@ def crawl_noon_to_csv(
 
     print(f"💾 Saved {len(rows)} Noon products to {output_path}")
     return len(rows)
-
-
-if __name__ == "__main__":
-    # Quick manual test:
-    # python crawl_noon.py
-    n = crawl_noon_to_csv("samsung s25 ultra", output_path="noon_test.csv", pages=1, max_products=10)
-    print("Collected:", n)
