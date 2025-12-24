@@ -148,12 +148,37 @@ def _pick_image(hit: dict) -> str:
 
 
 def _pick_link(hit: dict) -> str:
-    slug = hit.get("url") or hit.get("product_url") or hit.get("path") or ""
-    if not slug:
-        return ""
+    """
+    Construct proper Noon product URL with SKU.
+    Format: https://www.noon.com/egypt-en/{slug}/{sku}/p/
+    """
+    # Get SKU (required for proper URL)
+    sku = hit.get("sku") or hit.get("SKU") or hit.get("product_sku") or ""
+    
+    # Get slug/URL
+    slug = hit.get("url") or hit.get("product_url") or hit.get("path") or hit.get("slug") or ""
+    
+    # If it's already a full URL, return it
     if isinstance(slug, str) and (slug.startswith("http://") or slug.startswith("https://")):
         return slug
-    return urljoin(BASE_SITE + "/", str(slug).lstrip("/"))
+    
+    # If we have both slug and SKU, construct the proper URL
+    if slug and sku:
+        # Clean the slug
+        slug = str(slug).lstrip("/")
+        # Construct URL in format: /egypt-en/{slug}/{sku}/p/
+        if not slug.startswith("egypt-en/"):
+            slug = f"egypt-en/{slug}"
+        # Remove /p/ if it already exists in slug
+        slug = slug.replace("/p/", "").replace("/p", "")
+        # Build final URL
+        return f"https://www.noon.com/{slug}/{sku}/p/"
+    
+    # Fallback: if we only have slug, use old method
+    if slug:
+        return urljoin(BASE_SITE + "/", str(slug).lstrip("/"))
+    
+    return ""
 
 
 def crawl_noon_to_csv(
